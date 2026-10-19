@@ -1,0 +1,217 @@
+#!/bin/zsh
+# ============================================================================
+#  Astra installer — local ServiceNow docs assistant
+#
+#  Flow:
+#    0. Ask which model to run (4-bit vs 8-bit) — not every laptop has 24 GB.
+#    1. Check required tools (curl, git, Python 3.11+, Ollama); install/upgrade
+#       whatever is missing or too old.
+#    2. Download the latest LLM models.
+#    3. Configure and install (Python env, .astrarc, docs, index).
+# ============================================================================
+set -e
+HERE="${0:A:h}"
+BIN="$HOME/.local/bin"
+OLLAMA_DIR="$HOME/.local/ollama"
+# Always fetch the current latest macOS build — the registry rejects pulls of
+# recent models (e.g. Gemma 4) from older Ollama versions.
+OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip"
+# ServiceNow docs live inside this repo, under ./DOC (git-ignored).
+DOCS="$HERE/DOC"
+export PATH="$BIN:$PATH"
+OLLAMA_BIN=""
+
+have() { command -v "$1" >/dev/null 2>&1; }
+ram_gb() { echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )); }
+
+start_server() {
+  if ! curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+    mkdir -p "$OLLAMA_DIR"
+    nohup "$OLLAMA_BIN" serve > "$OLLAMA_DIR/serve.log" 2>&1 &
+    until curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; do sleep 1; done
+  fi
+}
+
+install_latest_ollama() {
+  echo "  Installing/upgrading Ollama to the latest release..."
+  mkdir -p "$OLLAMA_DIR" "$BIN"
+  curl -fL --retry 3 -o /tmp/Ollama-darwin.zip "$OLLAMA_URL"
+  ditto -x -k /tmp/Ollama-darwin.zip "$OLLAMA_DIR/"
+  ln -sf "$OLLAMA_DIR/Ollama.app/Contents/Resources/ollama" "$BIN/ollama"
+  OLLAMA_BIN="$BIN/ollama"
+  pkill -f "ollama serve" 2>/dev/null || true
+  sleep 1
+  start_server
+}
+
+# A model counts as present if `ollama list` has it (with or without :latest).
+have_model() { "$OLLAMA_BIN" list 2>/dev/null | awk '{print $1}' | grep -qxE "$1(:latest)?"; }
+
+# Ensure a model is available: keep an existing copy (tolerating a failed
+# refresh from an old client), otherwise pull — upgrading Ollama once if the
+# registry rejects the pull as too old.
+ensure_model() {
+  local m="$1"
+  if have_model "$m"; then
+    echo "  $m: already installed."
+    "$OLLAMA_BIN" pull "$m" >/dev/null 2>&1 && echo "    refreshed to latest." \
+      || echo "    kept local copy (registry needs a newer client to refresh)."
+    return 0
+  fi
+  echo "  $m: downloading..."
+  if "$OLLAMA_BIN" pull "$m"; then return 0; fi
+  echo "  Pull failed — upgrading Ollama, then retrying..."
+  install_latest_ollama
+  "$OLLAMA_BIN" pull "$m" && return 0 || return 1
+}
+
+echo "=============================================="
+echo " Astra installer — local ServiceNow docs assistant"
+echo "=============================================="
+
+# --- 0. Model choice --------------------------------------------------------
+RAM=$(ram_gb)
+echo ""
+echo "Detected memory: ${RAM} GB"
+echo "Pick the Gemma 4 12B quantization for answer generation:"
+echo "  [1] 4-bit  -> gemma4:12b        (~7.6 GB, faster, lower RAM)   [default]"
+echo "  [2] 8-bit  -> gemma4:12b-it-q8_0   (~13 GB, higher quality, ~24 GB RAM)"
+if (( RAM >= 24 )); then
+  echo "  (Your machine can comfortably run either.)"
+else
+  echo "  (Recommended for you: 4-bit — 8-bit wants ~24 GB and may swap.)"
+fi
+printf "Enter 1 or 2 [1]: "
+read CHOICE
+if [[ "$CHOICE" == "2" ]]; then
+  GEN_MODEL="gemma4:12b-it-q8_0"
+  if (( RAM < 24 )); then
+    echo "WARNING: 8-bit needs ~24 GB RAM; you have ${RAM} GB. It may be slow or swap."
+    printf "Use 8-bit anyway? [y/N]: "
+    read C2
+    [[ "$C2" == "y" || "$C2" == "Y" ]] || GEN_MODEL="gemma4:12b"
+  fi
+else
+  GEN_MODEL="gemma4:12b"
+fi
+echo "-> Selected model: $GEN_MODEL"
+
+# --- 1. Required tools ------------------------------------------------------
+echo ""
+echo "[1/4] Checking required tools..."
+
+# curl — needed by this script and by the runtime.
+if ! have curl; then
+  echo "  ERROR: 'curl' is required but not found. Install it and re-run."
+  exit 1
+fi
+echo "  curl: ok"
+
+# git — needed to clone the docs. Auto-install via Homebrew or Xcode CLT.
+if have git && git --version >/dev/null 2>&1; then
+  echo "  git:  $(git --version)"
+else
+  echo "  git not found — attempting to install..."
+  if have brew; then
+    brew install git
+  else
+    echo "  Triggering Xcode Command Line Tools install (provides git)..."
+    xcode-select --install 2>/dev/null || true
+    echo "  Finish the install dialog, then re-run ./install."
+    exit 1
+  fi
+fi
+
+# Python 3.11+ — runs Astra.
+PYV=""
+have python3 && PYV=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)
+py_ok() { [[ -n "$PYV" ]] && { local a=${PYV%%.*} b=${PYV##*.}; (( a>3 || (a==3 && b>=11) )); } }
+if py_ok; then
+  echo "  python: $PYV"
+else
+  echo "  Python 3.11+ not found (have: ${PYV:-none}) — attempting to install..."
+  if have brew; then
+    brew install python@3.12 || brew upgrade python || true
+    PYV=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)
+    py_ok || { echo "  Could not get Python 3.11+. Install it, then re-run."; exit 1; }
+    echo "  python: $PYV"
+  else
+    echo "  Please install Python 3.11+ (https://www.python.org or Homebrew), then re-run."
+    exit 1
+  fi
+fi
+
+# Ollama — keep an existing install (models run fine on it); install the latest
+# build only if it's missing. A too-old client is upgraded on demand at pull
+# time (see ensure_model), so a working setup isn't disrupted needlessly.
+have ollama && OLLAMA_BIN="$(command -v ollama)"
+[[ -x "$BIN/ollama" ]] && OLLAMA_BIN="$BIN/ollama"
+if [[ -z "$OLLAMA_BIN" ]]; then
+  echo "  ollama not found — installing..."
+  install_latest_ollama
+fi
+echo "  ollama: $("$OLLAMA_BIN" --version 2>&1 | tail -1)"
+
+# --- 2. Download the latest models -----------------------------------------
+echo ""
+echo "[2/4] Downloading models..."
+start_server
+if ! ensure_model "$GEN_MODEL"; then
+  if [[ "$GEN_MODEL" != "gemma4:12b" ]]; then
+    echo "  Falling back to gemma4:12b (4-bit)."
+    GEN_MODEL="gemma4:12b"
+    ensure_model "$GEN_MODEL" || { echo "  ERROR: could not obtain a generation model."; exit 1; }
+  else
+    echo "  ERROR: could not obtain $GEN_MODEL."; exit 1
+  fi
+fi
+ensure_model nomic-embed-text || { echo "  ERROR: could not obtain the embeddings model."; exit 1; }
+
+# --- 3. Documentation + configuration --------------------------------------
+echo ""
+echo "[3/4] Python environment, docs, and configuration..."
+python3 -m venv "$HERE/.venv"
+"$HERE/.venv/bin/pip" install -q --upgrade pip
+"$HERE/.venv/bin/pip" install -q -r "$HERE/requirements.txt"
+
+# Docs live in ./DOC: clone on first install, pull to update on later runs.
+if [[ -d "$DOCS/.git" ]]; then
+  echo "  Updating ServiceNow docs in $DOCS ..."
+  git -C "$DOCS" pull --ff-only || echo "  (could not fast-forward; keeping current docs)"
+else
+  echo "  Cloning ServiceNow docs into $DOCS (~450 MB)..."
+  git clone https://github.com/ServiceNow/ServiceNowDocs.git "$DOCS"
+fi
+
+RELEASE=""
+[[ -d "$DOCS/.git" ]] && RELEASE="$(git -C "$DOCS" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+RELEASE="${RELEASE:-australia}"
+
+# ASTRA_RELEASE=latest means "auto-track whatever the docs repo currently
+# ships as its newest release" — resolved dynamically (see astra_lib.RELEASE),
+# so future release families (e.g. after australia) are picked up without
+# editing .astrarc. Use `/r <name>` in the CLI to pin a specific release.
+cat > "$HERE/.astrarc" <<EOF
+# Astra config — written by ./install. Edit values, keep KEY=VALUE.
+ASTRA_GEN_MODEL=$GEN_MODEL
+ASTRA_EMBED_MODEL=nomic-embed-text
+ASTRA_RELEASE=latest
+ASTRA_DOCS=$DOCS
+EOF
+echo "  Saved config to .astrarc (release: latest -> $RELEASE, model: $GEN_MODEL)"
+
+# --- 4. Build the index ----------------------------------------------------
+echo ""
+echo "[4/4] Building the search index for '$RELEASE' (full corpus can take ~1h)..."
+if [[ -d "$DOCS/markdown" ]]; then
+  "$HERE/astra" --index
+else
+  echo "  No markdown found in $DOCS — skipping index."
+fi
+
+echo ""
+echo "=============================================="
+echo " Done. Model: $GEN_MODEL   Release: $RELEASE"
+echo " Launch:  ./astra"
+echo " If you skipped indexing, run:  ./astra --index"
+echo "=============================================="

@@ -1,0 +1,85 @@
+#!/bin/zsh
+# ============================================================================
+#  Astra uninstaller — removes this software.
+#
+#  Always removes Astra's own generated files (venv, indexes, config, caches).
+#  Everything shared with the rest of your system (downloaded models, the
+#  Ollama runtime, the docs corpus) is removed only if you confirm it —
+#  so this won't nuke an Ollama you were already using.
+#  The repo source files are left in place.
+# ============================================================================
+HERE="${0:A:h}"
+BIN="$HOME/.local/bin"
+OLLAMA_DIR="$HOME/.local/ollama"
+DOCS="$HERE/DOC"
+export PATH="$BIN:$PATH"
+
+echo "=============================================="
+echo " Astra uninstaller"
+echo "=============================================="
+
+# Which generation model did this install use? (so we can offer to remove it)
+GEN_MODEL=""
+[[ -f "$HERE/.astrarc" ]] && GEN_MODEL="$(grep '^ASTRA_GEN_MODEL=' "$HERE/.astrarc" | cut -d= -f2)"
+
+printf "Remove Astra's local files (venv, index-*.db, .astrarc, __pycache__)? [y/N]: "
+read GO
+if [[ "$GO" != "y" && "$GO" != "Y" ]]; then echo "Aborted."; exit 0; fi
+
+echo "Removing Astra local files..."
+rm -rf "$HERE/.venv" "$HERE/__pycache__"
+rm -f  "$HERE/.astrarc"
+# (N) = null-glob: patterns that match nothing expand to nothing instead of
+# raising a zsh "no matches found" error.
+for f in "$HERE"/index-*.db(N) "$HERE"/index-*.db-journal(N) \
+         "$HERE"/index-*.db-wal(N) "$HERE"/index-*.db-shm(N); do
+  rm -f "$f"
+done
+
+# --- Downloaded models (shared) --------------------------------------------
+printf "Remove the downloaded Ollama models (gemma4:12b*, nomic-embed-text%s)? [y/N]: " \
+       "${GEN_MODEL:+, $GEN_MODEL}"
+read RM_MODELS
+if [[ "$RM_MODELS" == "y" || "$RM_MODELS" == "Y" ]]; then
+  if [[ -x "$BIN/ollama" ]] || command -v ollama >/dev/null 2>&1; then
+    OLLAMA_BIN="$(command -v ollama || echo "$BIN/ollama")"
+    if ! curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+      nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
+      sleep 2
+    fi
+    echo "Removing models..."
+    for m in "$GEN_MODEL" gemma4:12b gemma4:12b-it-q8_0 nomic-embed-text; do
+      [[ -n "$m" ]] && "$OLLAMA_BIN" rm "$m" 2>/dev/null
+    done
+  fi
+fi
+
+# --- Ollama runtime we installed (only the one under ~/.local) -------------
+if [[ -d "$OLLAMA_DIR" || -L "$BIN/ollama" ]]; then
+  printf "Remove the Ollama runtime Astra installed at %s? [y/N]: " "$OLLAMA_DIR"
+  read RM_OLLAMA
+  if [[ "$RM_OLLAMA" == "y" || "$RM_OLLAMA" == "Y" ]]; then
+    echo "Stopping Ollama server..."
+    pkill -f "ollama serve" 2>/dev/null
+    rm -f "$BIN/ollama"
+    rm -rf "$OLLAMA_DIR"
+    printf "Also delete the Ollama model cache at ~/.ollama (ALL downloaded models)? [y/N]: "
+    read WIPE
+    [[ "$WIPE" == "y" || "$WIPE" == "Y" ]] && rm -rf "$HOME/.ollama"
+  fi
+fi
+
+# --- Docs corpus + per-release worktrees (shared) --------------------------
+if [[ -d "$DOCS" ]]; then
+  printf "Delete the ServiceNowDocs corpus + worktrees at %s*? [y/N]: " "$DOCS"
+  read RM_DOCS
+  if [[ "$RM_DOCS" == "y" || "$RM_DOCS" == "Y" ]]; then
+    git -C "$DOCS" worktree prune 2>/dev/null
+    for wt in "$DOCS"-*(N); do [[ -d "$wt" ]] && rm -rf "$wt"; done
+    rm -rf "$DOCS"
+  fi
+fi
+
+echo ""
+echo "Uninstall complete. Repo source files were left in place."
+echo "(Delete the repo folder itself to remove those too.)"

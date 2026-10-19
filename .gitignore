@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local vector stores (rebuild with: ./astra --index)
+index-*.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.lock
+
+# Local machine config written by ./install
+.astrarc
+
+# ServiceNow docs corpus cloned by ./install (and per-release worktrees)
+DOC/
+DOC-*/
+
+# OS
+.DS_Store

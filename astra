@@ -1,0 +1,38 @@
+#!/bin/zsh
+# Astra — local ServiceNow docs assistant.
+#   ./astra                         launch the interactive CLI
+#   ./astra "your question"         one-shot question, then exit
+#   ./astra --index [--full] [--release NAME]   build / refresh an index
+HERE="${0:A:h}"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Load persisted config (model, release, docs path) so Python + shell agree.
+if [[ -f "$HERE/.astrarc" ]]; then
+  source "$HERE/.astrarc"
+  export ASTRA_GEN_MODEL ASTRA_EMBED_MODEL ASTRA_RELEASE ASTRA_DOCS OLLAMA_HOST ASTRA_KEEP_ALIVE
+fi
+
+PY="$HERE/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  echo "Astra isn't installed yet. Run ./install first."
+  exit 1
+fi
+
+# Ensure the Ollama server is up (needed for embeddings + generation).
+if ! curl -s "${OLLAMA_HOST:-http://127.0.0.1:11434}/api/version" >/dev/null 2>&1; then
+  echo "Starting ollama server..."
+  nohup ollama serve > "$HOME/.local/ollama/serve.log" 2>&1 &
+  until curl -s "${OLLAMA_HOST:-http://127.0.0.1:11434}/api/version" >/dev/null 2>&1; do sleep 1; done
+fi
+
+if [[ "$1" == "--index" ]]; then
+  shift
+  exec "$PY" "$HERE/astra_index.py" "$@"
+fi
+
+# Warm the generation model in the background so its load overlaps with startup.
+curl -s "${OLLAMA_HOST:-http://127.0.0.1:11434}/api/generate" -d \
+  "{\"model\":\"${ASTRA_GEN_MODEL:-gemma4:12b}\",\"keep_alive\":\"${ASTRA_KEEP_ALIVE:-30m}\"}" \
+  >/dev/null 2>&1 &
+
+exec "$PY" "$HERE/astra_repl.py" "$@"
