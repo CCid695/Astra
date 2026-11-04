@@ -7,8 +7,10 @@ Each ServiceNow release family is a *branch* of the public
 Other families are materialized as sibling git *worktrees*
 (`<docs>-<release>/`) so several releases can coexist without re-checkouts.
 """
+from __future__ import annotations
 import os
 import subprocess
+from typing import Optional, List, Callable
 
 import astra_lib as L
 
@@ -18,18 +20,18 @@ CLONE_URL = "https://github.com/ServiceNow/ServiceNowDocs.git"
 NON_FAMILY = {"main", "HEAD", "mobile", "nofamily", "other", "store"}
 
 
-def _git(args, cwd=None, check=True, capture=True):
+def _git(args: List[str], cwd: Optional[str] = None, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git"] + args, cwd=cwd, check=check,
         text=True, capture_output=capture,
     )
 
 
-def is_cloned():
+def is_cloned() -> bool:
     return os.path.isdir(os.path.join(L.DOCS_ROOT(), ".git"))
 
 
-def ensure_clone(progress=print):
+def ensure_clone(progress: Callable[[str], None] = print) -> str:
     """Clone the docs repo to $ASTRA_DOCS if it isn't there yet."""
     root = L.DOCS_ROOT()
     if is_cloned():
@@ -40,7 +42,7 @@ def ensure_clone(progress=print):
     return root
 
 
-def default_branch():
+def default_branch() -> Optional[str]:
     """Branch currently checked out in the main worktree."""
     try:
         r = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=L.DOCS_ROOT())
@@ -49,7 +51,7 @@ def default_branch():
         return None
 
 
-def latest_release():
+def latest_release() -> Optional[str]:
     """Release family the docs repo currently advertises as its default
     branch (origin/HEAD) — i.e. whatever ServiceNow ships as the newest
     release. Refreshed by `update()` on every /update, so a brand-new
@@ -65,7 +67,7 @@ def latest_release():
         return None
 
 
-def list_releases():
+def list_releases() -> List[str]:
     """Available release families (remote branches, minus infra branches)."""
     if not is_cloned():
         return []
@@ -73,7 +75,7 @@ def list_releases():
         r = _git(["branch", "-r"], cwd=L.DOCS_ROOT())
     except Exception:
         return []
-    names = []
+    names: List[str] = []
     for line in r.stdout.splitlines():
         line = line.strip()
         if "->" in line:            # e.g. origin/HEAD -> origin/australia
@@ -85,14 +87,14 @@ def list_releases():
     return sorted(set(names))
 
 
-def worktree_path(release):
+def worktree_path(release: str) -> str:
     """Filesystem path holding the given release's checkout."""
     if release == default_branch():
         return L.DOCS_ROOT()
     return "%s-%s" % (L.DOCS_ROOT(), release)
 
 
-def markdown_dir(release=None, ensure=True, progress=print):
+def markdown_dir(release: Optional[str] = None, ensure: bool = True, progress: Callable[[str], None] = print) -> str:
     """Return the markdown/ directory for a release, creating a worktree
     on demand for non-default families."""
     rel = release or L.RELEASE()
@@ -114,7 +116,7 @@ def markdown_dir(release=None, ensure=True, progress=print):
     return md
 
 
-def update(release=None, progress=print):
+def update(release: Optional[str] = None, progress: Callable[[str], None] = print) -> str:
     """Fetch latest and fast-forward the release's working tree.
     Returns the markdown dir on success."""
     ensure_clone(progress=progress)

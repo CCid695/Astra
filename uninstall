@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 # ============================================================================
 #  Astra uninstaller — removes this software.
 #
@@ -8,7 +8,7 @@
 #  so this won't nuke an Ollama you were already using.
 #  The repo source files are left in place.
 # ============================================================================
-HERE="${0:A:h}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"
 OLLAMA_DIR="$HOME/.local/ollama"
 DOCS="$HERE/DOC"
@@ -29,11 +29,10 @@ if [[ "$GO" != "y" && "$GO" != "Y" ]]; then echo "Aborted."; exit 0; fi
 echo "Removing Astra local files..."
 rm -rf "$HERE/.venv" "$HERE/__pycache__"
 rm -f  "$HERE/.astrarc"
-# (N) = null-glob: patterns that match nothing expand to nothing instead of
-# raising a zsh "no matches found" error.
-for f in "$HERE"/index-*.db(N) "$HERE"/index-*.db-journal(N) \
-         "$HERE"/index-*.db-wal(N) "$HERE"/index-*.db-shm(N); do
-  rm -f "$f"
+# Remove index files if they exist (bash-compatible)
+for f in "$HERE"/index-*.db "$HERE"/index-*.db-journal \
+         "$HERE"/index-*.db-wal "$HERE"/index-*.db-shm; do
+  [[ -f "$f" ]] && rm -f "$f"
 done
 
 # --- Downloaded models (shared) --------------------------------------------
@@ -75,7 +74,10 @@ if [[ -d "$DOCS" ]]; then
   read RM_DOCS
   if [[ "$RM_DOCS" == "y" || "$RM_DOCS" == "Y" ]]; then
     git -C "$DOCS" worktree prune 2>/dev/null
-    for wt in "$DOCS"-*(N); do [[ -d "$wt" ]] && rm -rf "$wt"; done
+    # Remove worktrees (bash-compatible)
+    for wt in "$DOCS"-*; do
+      [[ -d "$wt" ]] && rm -rf "$wt"
+    done
     rm -rf "$DOCS"
   fi
 fi

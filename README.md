@@ -137,10 +137,23 @@ ASTRA_EMBED_MODEL=nomic-embed-text    # embedding model (must match index time)
 ASTRA_RELEASE=australia               # default release family
 ASTRA_DOCS=./DOC                      # docs checkout (inside the repo)
 OLLAMA_HOST=http://127.0.0.1:11434    # Ollama endpoint
+ASTRA_CHUNK_TARGET=1000               # target chunk size in characters
+ASTRA_CHUNK_OVERLAP=150               # chunk overlap in characters
+ASTRA_EMBED_BATCH=64                  # chunks per embedding request
+ASTRA_FILE_BATCH=200                  # files per DB transaction
+ASTRA_LOG_LEVEL=                      # logging level: DEBUG, INFO, WARNING, ERROR, or "" (disabled)
 ```
 
 Change the generation model at any time with `/model` (it can pull the model for
 you). Changing the embedding model requires a `/reindex --full`.
+
+**Important:** The embedding model (`nomic-embed-text`) requires specific task
+prefixes for optimal retrieval performance. Astra automatically adds these:
+- `search_document: ` prefix for document chunks during indexing
+- `search_query: ` prefix for user queries during retrieval
+
+Do not change the embedding model to one that doesn't support these prefixes,
+or retrieval quality will degrade significantly.
 
 ---
 

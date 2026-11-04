@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 # ============================================================================
 #  Astra installer — local ServiceNow docs assistant
 #
@@ -10,19 +10,50 @@
 #    3. Configure and install (Python env, .astrarc, docs, index).
 # ============================================================================
 set -e
-HERE="${0:A:h}"
+# Get script directory (works in both bash and zsh)
+HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"
 OLLAMA_DIR="$HOME/.local/ollama"
-# Always fetch the current latest macOS build — the registry rejects pulls of
-# recent models (e.g. Gemma 4) from older Ollama versions.
-OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip"
+
+# Detect platform
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+# Set Ollama download URLs based on platform
+if [[ "$OS" == "Darwin" ]]; then
+  OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip"
+  OLLAMA_SHA256_URL="https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip.sha256"
+elif [[ "$OS" == "Linux" ]]; then
+  if [[ "$ARCH" == "x86_64" ]]; then
+    OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64"
+    OLLAMA_SHA256_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.sha256"
+  elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+    OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-arm64"
+    OLLAMA_SHA256_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-arm64.sha256"
+  else
+    echo "  ERROR: Unsupported architecture: $ARCH"
+    exit 1
+  fi
+else
+  echo "  ERROR: Unsupported OS: $OS"
+  exit 1
+fi
+
 # ServiceNow docs live inside this repo, under ./DOC (git-ignored).
 DOCS="$HERE/DOC"
 export PATH="$BIN:$PATH"
 OLLAMA_BIN=""
 
 have() { command -v "$1" >/dev/null 2>&1; }
-ram_gb() { echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )); }
+ram_gb() {
+  if [[ "$OS" == "Darwin" ]]; then
+    echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+  elif [[ "$OS" == "Linux" ]]; then
+    echo $(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0) / 1048576 ))
+  else
+    echo 0
+  fi
+}
 
 start_server() {
   if ! curl -s http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
@@ -35,9 +66,51 @@ start_server() {
 install_latest_ollama() {
   echo "  Installing/upgrading Ollama to the latest release..."
   mkdir -p "$OLLAMA_DIR" "$BIN"
-  curl -fL --retry 3 -o /tmp/Ollama-darwin.zip "$OLLAMA_URL"
-  ditto -x -k /tmp/Ollama-darwin.zip "$OLLAMA_DIR/"
-  ln -sf "$OLLAMA_DIR/Ollama.app/Contents/Resources/ollama" "$BIN/ollama"
+
+  if [[ "$OS" == "Darwin" ]]; then
+    curl -fL --retry 3 -o /tmp/Ollama-darwin.zip "$OLLAMA_URL"
+    curl -fL --retry 3 -o /tmp/Ollama-darwin.zip.sha256 "$OLLAMA_SHA256_URL"
+
+    # Verify checksum
+    echo "  Verifying checksum..."
+    EXPECTED_SHA256=$(cat /tmp/Ollama-darwin.zip.sha256 | awk '{print $1}')
+    ACTUAL_SHA256=$(shasum -a 256 /tmp/Ollama-darwin.zip | awk '{print $1}')
+
+    if [[ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]]; then
+      echo "  ERROR: Checksum verification failed!"
+      echo "  Expected: $EXPECTED_SHA256"
+      echo "  Actual:   $ACTUAL_SHA256"
+      rm -f /tmp/Ollama-darwin.zip /tmp/Ollama-darwin.zip.sha256
+      exit 1
+    fi
+    echo "  Checksum verified."
+
+    ditto -x -k /tmp/Ollama-darwin.zip "$OLLAMA_DIR/"
+    rm -f /tmp/Ollama-darwin.zip /tmp/Ollama-darwin.zip.sha256
+    ln -sf "$OLLAMA_DIR/Ollama.app/Contents/Resources/ollama" "$BIN/ollama"
+  elif [[ "$OS" == "Linux" ]]; then
+    curl -fL --retry 3 -o /tmp/ollama "$OLLAMA_URL"
+    curl -fL --retry 3 -o /tmp/ollama.sha256 "$OLLAMA_SHA256_URL"
+
+    # Verify checksum
+    echo "  Verifying checksum..."
+    EXPECTED_SHA256=$(cat /tmp/ollama.sha256 | awk '{print $1}')
+    ACTUAL_SHA256=$(sha256sum /tmp/ollama | awk '{print $1}')
+
+    if [[ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]]; then
+      echo "  ERROR: Checksum verification failed!"
+      echo "  Expected: $EXPECTED_SHA256"
+      echo "  Actual:   $ACTUAL_SHA256"
+      rm -f /tmp/ollama /tmp/ollama.sha256
+      exit 1
+    fi
+    echo "  Checksum verified."
+
+    chmod +x /tmp/ollama
+    mv /tmp/ollama "$BIN/ollama"
+    rm -f /tmp/ollama.sha256
+  fi
+
   OLLAMA_BIN="$BIN/ollama"
   pkill -f "ollama serve" 2>/dev/null || true
   sleep 1
@@ -184,7 +257,9 @@ else
 fi
 
 RELEASE=""
-[[ -d "$DOCS/.git" ]] && RELEASE="$(git -C "$DOCS" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+if [[ -d "$DOCS/.git" ]]; then
+  RELEASE="$(git -C "$DOCS" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+fi
 RELEASE="${RELEASE:-australia}"
 
 # ASTRA_RELEASE=latest means "auto-track whatever the docs repo currently

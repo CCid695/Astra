@@ -1,10 +1,19 @@
-#!/bin/zsh
+#!/bin/bash
 # Astra — local ServiceNow docs assistant.
 #   ./astra                         launch the interactive CLI
 #   ./astra "your question"         one-shot question, then exit
 #   ./astra --index [--full] [--release NAME]   build / refresh an index
-HERE="${0:A:h}"
+#   ./astra --version               show version and exit
+HERE="$(cd "$(dirname "$0")" && pwd)"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Handle --version flag
+if [[ "$1" == "--version" || "$1" == "-v" ]]; then
+  # Extract version from astra_lib.py
+  VERSION=$(grep '^VERSION = ' "$HERE/astra_lib.py" | awk -F'"' '{print $2}')
+  echo "Astra $VERSION"
+  exit 0
+fi
 
 # Load persisted config (model, release, docs path) so Python + shell agree.
 if [[ -f "$HERE/.astrarc" ]]; then

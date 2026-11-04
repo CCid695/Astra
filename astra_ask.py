@@ -13,11 +13,14 @@ The four stages map directly onto the product requirements:
 
 Everything runs locally against Ollama; nothing leaves the host.
 """
+from __future__ import annotations
 import os
 import re
 import sys
 import json
 import time
+import sqlite3
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 
@@ -27,7 +30,7 @@ import astra_lib as L
 # --------------------------------------------------------------------------
 # Index loading + retrieval
 # --------------------------------------------------------------------------
-def load_matrix(conn):
+def load_matrix(conn: sqlite3.Connection) -> Tuple[List[str], List[str], np.ndarray]:
     rows = conn.execute("SELECT id, path, text, emb FROM chunks").fetchall()
     if not rows:
         raise RuntimeError(
@@ -41,7 +44,7 @@ def load_matrix(conn):
     return list(paths), list(texts), M
 
 
-def retrieve(query_text, paths, texts, M, k=6):
+def retrieve(query_text: str, paths: List[str], texts: List[str], M: np.ndarray, k: int = 6) -> List[Tuple[float, str, str]]:
     q = L.embed([query_text], is_query=True)[0]
     q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
     with np.errstate(all="ignore"):
@@ -66,7 +69,7 @@ PARSE_SYSTEM = (
 )
 
 
-def _extract_json(s):
+def _extract_json(s: str) -> Optional[Dict[str, Any]]:
     m = re.search(r"\{.*\}", s, re.DOTALL)
     if not m:
         return None
@@ -76,7 +79,7 @@ def _extract_json(s):
         return None
 
 
-def parse_query(question):
+def parse_query(question: str) -> Dict[str, Any]:
     """Return {language, search_query, keywords}. Degrades gracefully."""
     fallback = {"language": "", "search_query": question, "keywords": []}
     try:
@@ -99,7 +102,7 @@ def parse_query(question):
 # --------------------------------------------------------------------------
 # Stage 3 — synthesis (answer in the question's language)
 # --------------------------------------------------------------------------
-def _answer_system(language):
+def _answer_system(language: Optional[str]) -> str:
     lang = language or "the same language as the question"
     return (
         "You are a ServiceNow documentation assistant. Answer the user's question "
@@ -111,7 +114,7 @@ def _answer_system(language):
     )
 
 
-def synthesize(question, hits, language):
+def synthesize(question: str, hits: List[Tuple[float, str, str]], language: Optional[str]) -> str:
     context = "\n\n".join(
         "[Source %d: %s]\n%s" % (r + 1, L.rel_markdown_path(p), t)
         for r, (_, p, t) in enumerate(hits)
@@ -123,7 +126,7 @@ def synthesize(question, hits, language):
 # --------------------------------------------------------------------------
 # Stage 4 — citations
 # --------------------------------------------------------------------------
-def build_sources(hits, release):
+def build_sources(hits: List[Tuple[float, str, str]], release: str) -> List[Dict[str, str]]:
     """Unique official sources in first-seen (rank) order."""
     seen, out = set(), []
     for _, path, _ in hits:
@@ -139,7 +142,7 @@ def build_sources(hits, release):
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
-def ask(question, k=6, retrieve_only=False, release=None):
+def ask(question: str, k: int = 6, retrieve_only: bool = False, release: Optional[str] = None) -> Dict[str, Any]:
     """Run the full pipeline. Returns a result dict."""
     rel = release or L.RELEASE()
     conn = L.connect(rel)
@@ -149,7 +152,7 @@ def ask(question, k=6, retrieve_only=False, release=None):
         {"language": "", "search_query": question, "keywords": []}
 
     hits = retrieve(parsed["search_query"], paths, texts, M, k=k)
-    result = {
+    result: Dict[str, Any] = {
         "release": rel,
         "question": question,
         "parsed": parsed,

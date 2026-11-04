@@ -9,17 +9,17 @@ Usage:
 - --full drops the release's index and rebuilds from scratch.
 - DOCS_DIR overrides the markdown directory (default: resolved per release).
 """
+from __future__ import annotations
 import os
 import sys
 import time
 import errno
 import sqlite3
+from typing import Callable, Optional, Tuple, List, Any, Dict
 
 import astra_lib as L
 import astra_corpus as C
 
-EMBED_BATCH = 64     # chunks per embedding request
-FILE_BATCH = 200     # files written (and committed) per transaction
 DB_RETRIES = 6       # write attempts before giving up on a transient DB error
 
 
@@ -27,7 +27,7 @@ DB_RETRIES = 6       # write attempts before giving up on a transient DB error
 # Single-writer lock — only one index build may touch a release's db at a time.
 # Prevents two concurrent builds from deadlocking on "database is locked".
 # --------------------------------------------------------------------------
-def _pid_alive(pid):
+def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
@@ -37,7 +37,7 @@ def _pid_alive(pid):
     return True
 
 
-def _acquire_lock(release):
+def _acquire_lock(release: str) -> str:
     """Take the build lock for a release, or raise if another live build holds it.
     Returns the lock file path (pass to _release_lock)."""
     lock = L.db_path(release) + ".lock"
@@ -56,7 +56,7 @@ def _acquire_lock(release):
     return lock
 
 
-def _release_lock(lock):
+def _release_lock(lock: str) -> None:
     try:
         if os.path.exists(lock) and open(lock).read().strip() == str(os.getpid()):
             os.remove(lock)
@@ -64,7 +64,7 @@ def _release_lock(lock):
         pass
 
 
-def iter_md(root):
+def iter_md(root: str):
     for dirpath, dirnames, filenames in os.walk(root):
         if ".git" in dirpath.split(os.sep):
             continue
@@ -73,17 +73,18 @@ def iter_md(root):
                 yield os.path.join(dirpath, fn)
 
 
-def _embed_bytes(texts):
+def _embed_bytes(texts: List[str]) -> List[bytes]:
     """Embed a list of chunk texts, returning one emb-blob per text (in order).
     Embeddings are computed in EMBED_BATCH-sized requests."""
-    out = []
-    for i in range(0, len(texts), EMBED_BATCH):
-        for v in L.embed(texts[i:i + EMBED_BATCH]):
+    out: List[bytes] = []
+    batch_size = L.EMBED_BATCH()
+    for i in range(0, len(texts), batch_size):
+        for v in L.embed(texts[i:i + batch_size]):
             out.append(v.tobytes())
     return out
 
 
-def build_index(release=None, docs_dir=None, full=False, progress=print):
+def build_index(release: Optional[str] = None, docs_dir: Optional[str] = None, full: bool = False, progress: Callable[[str], None] = print) -> Tuple[int, int]:
     """Index a release's markdown corpus. Returns (new_files, total_chunks).
 
     Writes are done per file-batch in a single transaction and are resilient to
@@ -100,9 +101,10 @@ def build_index(release=None, docs_dir=None, full=False, progress=print):
 
     # Only one build may write a release's db at a time.
     lock = _acquire_lock(rel)
-    state = {"conn": None, "cur": None}
+    state: Dict[str, Any] = {"conn": None, "cur": None}
+    file_batch_size = L.FILE_BATCH()
 
-    def reconnect():
+    def reconnect() -> None:
         if state["conn"] is not None:
             try:
                 state["conn"].close()
@@ -111,7 +113,7 @@ def build_index(release=None, docs_dir=None, full=False, progress=print):
         state["conn"] = L.connect(rel)
         state["cur"] = state["conn"].cursor()
 
-    def retry(op, what):
+    def retry(op: Callable[[], Any], what: str) -> Any:
         delay = 1.0
         for attempt in range(DB_RETRIES):
             try:
@@ -143,22 +145,23 @@ def build_index(release=None, docs_dir=None, full=False, progress=print):
 
         done = skipped = nchunks = 0
         t0 = time.time()
-        batch = []  # list of (path, mtime, [chunk_text, ...])
+        batch: List[Tuple[str, float, List[str]]] = []  # list of (path, mtime, [chunk_text, ...])
 
-        def write_batch():
+        def write_batch() -> None:
             """Embed and persist the current file-batch as one retryable txn."""
             nonlocal done, nchunks
             if not batch:
                 return
             texts = [c for (_p, _m, parts) in batch for c in parts]
             embs = _embed_bytes(texts)
-            prepared, pos = [], 0
+            prepared: List[Tuple[str, float, List[Tuple[str, int, str, bytes]]]] = []
+            pos = 0
             for path, mtime, parts in batch:
                 recs = [(path, o, parts[o], embs[pos + o]) for o in range(len(parts))]
                 pos += len(parts)
                 prepared.append((path, mtime, recs))
 
-            def _persist():
+            def _persist() -> None:
                 cur = state["cur"]
                 for path, mtime, recs in prepared:
                     cur.execute("DELETE FROM chunks WHERE path=?", (path,))
@@ -188,11 +191,15 @@ def build_index(release=None, docs_dir=None, full=False, progress=print):
                 progress("  skip (read error) %s: %s" % (fp, e))
                 continue
             batch.append((fp, mtime, L.chunk_text(text)))
-            if len(batch) >= FILE_BATCH:
+            if len(batch) >= file_batch_size:
                 write_batch()
-                rate = done / (time.time() - t0)
-                progress("  indexed %d / %d files (%d new chunks, %.1f files/s)"
-                         % (done, total, nchunks, rate))
+                # Calculate progress and ETA
+                rate = done / (time.time() - t0) if (time.time() - t0) > 0 else 0
+                remaining = total - done
+                eta_sec = remaining / rate if rate > 0 else 0
+                eta_str = f"{eta_sec:.0f}s" if eta_sec < 60 else f"{eta_sec/60:.1f}m"
+                progress("  indexed %d / %d files (%d new chunks, %.1f files/s, ETA: %s)"
+                         % (done, total, nchunks, rate, eta_str))
 
         write_batch()
         grand = retry(lambda: state["cur"].execute(

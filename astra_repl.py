@@ -15,12 +15,33 @@ Commands:
   /help             Show this help.
   /exit, /quit      Exit the CLI (or just type 'exit').
 """
+from __future__ import annotations
 import os
 import sys
 import glob
 import time
 import shutil
 import subprocess
+from typing import Optional, List
+
+# Command history support
+try:
+    import readline
+    _HISTORY_CAP = True
+except ImportError:
+    _HISTORY_CAP = False
+
+# Rich library support (optional)
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.markdown import Markdown
+    from rich.table import Table
+    from rich.text import Text
+    _RICH_AVAILABLE = True
+except Exception:
+    _RICH_AVAILABLE = False
+    print("Note: 'rich' package not installed. Install for better formatting: pip install rich")
 
 # Raw-terminal key reading for the arrow-key model picker (POSIX only).
 try:
@@ -36,17 +57,49 @@ import astra_corpus as C
 import astra_ask as A
 import astra_index as IDX
 
-try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.markdown import Markdown
-    from rich.table import Table
-    from rich.text import Text
-except Exception:  # pragma: no cover
-    print("The 'rich' package is required. Install it: pip install rich")
-    sys.exit(1)
+# Initialize console (plain text if rich not available)
+if _RICH_AVAILABLE:
+    console = Console()
+else:
+    console = None  # Will use plain print statements
 
-console = Console()
+
+# Plain-text fallback functions
+def print_plain(msg: str) -> None:
+    """Print plain text message."""
+    print(msg)
+
+
+def print_error(msg: str) -> None:
+    """Print error message."""
+    print(f"ERROR: {msg}")
+
+
+def print_success(msg: str) -> None:
+    """Print success message."""
+    print(f"✓ {msg}")
+
+
+def print_warning(msg: str) -> None:
+    """Print warning message."""
+    print(f"WARNING: {msg}")
+
+
+# Console wrapper that works with or without rich
+def cprint(msg: str, style: str = "") -> None:
+    """Print with rich styling if available, otherwise plain text."""
+    if console:
+        console.print(msg)
+    else:
+        print(msg)
+
+
+def cinput(prompt: str) -> str:
+    """Get input with rich styling if available, otherwise plain input."""
+    if console:
+        return console.input(prompt)
+    else:
+        return input(prompt)
 
 # Curated one-line descriptions for the /model list.
 MODEL_NOTES = {
@@ -70,102 +123,147 @@ RECOMMENDED = [
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def ensure_server():
+def ensure_server() -> bool:
     if L.server_up():
         return True
-    console.print("[yellow]Ollama server not reachable. Start it with "
-                  "`ollama serve` (or open the Ollama app), then retry.[/yellow]")
+    if console:
+        console.print("[yellow]Ollama server not reachable. Start it with "
+                      "`ollama serve` (or open the Ollama app), then retry.[/yellow]")
+    else:
+        print_warning("Ollama server not reachable. Start it with `ollama serve` (or open the Ollama app), then retry.")
     return False
 
 
-def has_index(release=None):
+def has_index(release: Optional[str] = None) -> bool:
     return os.path.exists(L.db_path(release))
 
 
-def banner():
+def banner() -> None:
     rel = L.RELEASE()
     idx = ("indexed", "green") if has_index(rel) else ("no index — run /reindex", "red")
     tag = (" auto", "dim") if _auto_tracking() else ("", "dim")
-    console.print(Panel.fit(
-        Text.assemble(
-            ("Astra ", "bold cyan"), ("v%s" % L.VERSION, "cyan"),
-            "  — local ServiceNow docs assistant\n",
-            ("release: ", "dim"), (rel, "green"), tag, ("  (", "dim"), idx, (")\n", "dim"),
-            ("model:   ", "dim"), (L.GEN_MODEL(), "green"), "\n\n",
-            ("Type a question, or ", "dim"), ("/help", "cyan"), (" for commands.", "dim"),
-        ),
-        border_style="cyan",
-    ))
+
+    if console:
+        console.print(Panel.fit(
+            Text.assemble(
+                ("Astra ", "bold cyan"), ("v%s" % L.VERSION, "cyan"),
+                "  — local ServiceNow docs assistant\n",
+                ("release: ", "dim"), (rel, "green"), tag, ("  (", "dim"), idx, (")\n", "dim"),
+                ("model:   ", "dim"), (L.GEN_MODEL(), "green"), "\n\n",
+                ("Type a question, or ", "dim"), ("/help", "cyan"), (" for commands.", "dim"),
+            ),
+            border_style="cyan",
+        ))
+    else:
+        print(f"\nAstra v{L.VERSION} — local ServiceNow docs assistant")
+        print(f"release: {rel}{tag}  ({idx[0]})")
+        print(f"model:   {L.GEN_MODEL()}")
+        print("\nType a question, or /help for commands.\n")
+
+    # Setup command history if available
+    if _HISTORY_CAP:
+        history_file = os.path.join(L.HERE, ".astra_history")
+        try:
+            readline.read_history_file(history_file)
+        except Exception:
+            pass  # No history file yet, that's fine
 
 
 # --------------------------------------------------------------------------
 # command: /ask  (and bare questions)
 # --------------------------------------------------------------------------
-def cmd_ask(question, k=6):
+def cmd_ask(question: str, k: int = 6) -> None:
     question = question.strip()
     if not question:
-        console.print("[dim]Usage: /ask <question>[/dim]")
+        if console:
+            console.print("[dim]Usage: /ask <question>[/dim]")
+        else:
+            print("Usage: /ask <question>")
         return
     if not ensure_server():
         return
     if not has_index():
-        console.print("[red]No index for release '%s'. Run /reindex first.[/red]"
-                      % L.RELEASE())
+        if console:
+            console.print("[red]No index for release '%s'. Run /reindex first.[/red]"
+                          % L.RELEASE())
+        else:
+            print_error(f"No index for release '{L.RELEASE()}'. Run /reindex first.")
         return
 
     t0 = time.time()
-    try:
+    if console:
         with console.status("[cyan]Understanding the question…", spinner="dots"):
             res = A.ask(question, k=k)  # runs parse -> retrieve -> answer -> cite
-    except RuntimeError as e:
-        console.print("[red]%s[/red]" % e)
-        return
+    else:
+        print("Understanding the question…")
+        res = A.ask(question, k=k)
+
+    try:
+        parsed = res["parsed"]
+        if parsed["search_query"] and parsed["search_query"] != question:
+            if console:
+                console.print("[dim]retrieval query:[/dim] %s   [dim](lang: %s)[/dim]"
+                              % (parsed["search_query"], parsed["language"] or "?"))
+            else:
+                print(f"retrieval query: {parsed['search_query']}   (lang: {parsed['language'] or '?'})")
+
+        # matches
+        if console:
+            tbl = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+            tbl.add_column("#", justify="right", style="dim", width=3)
+            tbl.add_column("score", justify="right", style="cyan", width=6)
+            tbl.add_column("source")
+            for rank, (score, path) in enumerate(res["matches"], 1):
+                tbl.add_row(str(rank), "%.3f" % score, L.rel_markdown_path(path))
+            console.print(tbl)
+        else:
+            print("\nTop matches:")
+            for rank, (score, path) in enumerate(res["matches"], 1):
+                print(f"  [{rank}] {score:.3f}  {L.rel_markdown_path(path)}")
+
+        # answer
+        if console:
+            console.print(Panel(Markdown(res["answer"] or "_(no answer)_"),
+                                title="Answer", border_style="green"))
+        else:
+            print(f"\n--- Answer ---\n{res['answer'] or '(no answer)'}\n---")
+
+        # sources
+        if res["sources"]:
+            if console:
+                console.print("[bold]Official documentation sources[/bold]")
+                for i, s in enumerate(res["sources"], 1):
+                    console.print("  [cyan]%d.[/cyan] [link=%s]%s[/link]"
+                                  % (i, s["url"], s["title"]))
+                    console.print("     [link=%s][blue underline]%s[/blue underline][/link]"
+                                  % (s["url"], s["url"]), soft_wrap=True)
+            else:
+                print("\nOfficial documentation sources:")
+                for i, s in enumerate(res["sources"], 1):
+                    print(f"  {i}. {s['title']}")
+                    print(f"     {s['url']}")
+
+        if console:
+            console.print("[dim](model=%s, %.1fs)[/dim]" % (L.GEN_MODEL(), time.time() - t0))
+        else:
+            print(f"(model={L.GEN_MODEL()}, {time.time() - t0:.1f}s)")
     except Exception as e:
-        console.print("[red]Error: %s[/red]" % e)
-        return
-
-    parsed = res["parsed"]
-    if parsed["search_query"] and parsed["search_query"] != question:
-        console.print("[dim]retrieval query:[/dim] %s   [dim](lang: %s)[/dim]"
-                      % (parsed["search_query"], parsed["language"] or "?"))
-
-    # matches
-    tbl = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
-    tbl.add_column("#", justify="right", style="dim", width=3)
-    tbl.add_column("score", justify="right", style="cyan", width=6)
-    tbl.add_column("source")
-    for rank, (score, path) in enumerate(res["matches"], 1):
-        tbl.add_row(str(rank), "%.3f" % score, L.rel_markdown_path(path))
-    console.print(tbl)
-
-    # answer
-    console.print(Panel(Markdown(res["answer"] or "_(no answer)_"),
-                        title="Answer", border_style="green"))
-
-    # sources
-    if res["sources"]:
-        console.print("[bold]Official documentation sources[/bold]")
-        for i, s in enumerate(res["sources"], 1):
-            # Title is a short, non-wrapping clickable link (most reliable).
-            console.print("  [cyan]%d.[/cyan] [link=%s]%s[/link]"
-                          % (i, s["url"], s["title"]))
-            # URL as an underlined hyperlink; soft_wrap keeps it unbroken so
-            # terminals that rely on URL detection still open the whole link.
-            console.print("     [link=%s][blue underline]%s[/blue underline][/link]"
-                          % (s["url"], s["url"]), soft_wrap=True)
-    console.print("[dim](model=%s, %.1fs)[/dim]" % (L.GEN_MODEL(), time.time() - t0))
+        if console:
+            console.print("[red]Error: %s[/red]" % e)
+        else:
+            print_error(str(e))
 
 
 # --------------------------------------------------------------------------
 # command: /model
 # --------------------------------------------------------------------------
-def _model_candidates(installed):
+def _model_candidates(installed: set) -> List[str]:
     """The generation models offered in the picker: just the two Gemma 4 12B
     variants (4-bit and 8-bit)."""
     return [name for name in RECOMMENDED if name not in EMBED_ONLY]
 
 
-def _read_key():
+def _read_key() -> str:
     """Read a single keypress in raw mode. Returns 'up'/'down'/'enter'/'esc'
     or the literal character.
 
@@ -198,7 +296,7 @@ def _read_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _interactive_select(rows, current_idx, title):
+def _interactive_select(rows: List[str], current_idx: int, title: str) -> Optional[int]:
     """Arrow-key menu. Returns the chosen index, or None if cancelled."""
     n = len(rows)
     if n == 0:
@@ -208,7 +306,7 @@ def _interactive_select(rows, current_idx, title):
     idx = current_idx if 0 <= current_idx < n else 0
     console.print("[bold]%s[/bold]" % title, highlight=False)
 
-    def render(first=False):
+    def render(first: bool = False) -> None:
         if not first:
             sys.stdout.write("\x1b[%dA" % n)  # move cursor back up over the rows
         for i, row in enumerate(rows):
@@ -235,29 +333,47 @@ def _interactive_select(rows, current_idx, title):
         render()
 
 
-def _set_model(name, installed):
+def _set_model(name: str, installed: set) -> None:
     name = name.strip()
     if not name:
         return
     if name in EMBED_ONLY:
-        console.print("[red]'%s' is an embedding model, not a chat model.[/red]" % name)
+        if console:
+            console.print("[red]'%s' is an embedding model, not a chat model.[/red]" % name)
+        else:
+            print_error(f"'{name}' is an embedding model, not a chat model.")
         return
     if name not in installed:
-        console.print("[yellow]'%s' is not installed.[/yellow]" % name)
-        ans = console.input("Pull it now with ollama? [Y/n]: ").strip().lower()
+        if console:
+            console.print("[yellow]'%s' is not installed.[/yellow]" % name)
+        else:
+            print_warning(f"'{name}' is not installed.")
+        ans = cinput("Pull it now with ollama? [Y/n]: ").strip().lower()
         if ans in ("", "y", "yes"):
-            console.print("[cyan]Pulling %s …[/cyan]" % name)
+            if console:
+                console.print("[cyan]Pulling %s …[/cyan]" % name)
+            else:
+                print(f"Pulling {name} …")
             if subprocess.run(["ollama", "pull", name]).returncode != 0:
-                console.print("[red]Pull failed — model not changed.[/red]")
+                if console:
+                    console.print("[red]Pull failed — model not changed.[/red]")
+                else:
+                    print_error("Pull failed — model not changed.")
                 return
         else:
-            console.print("[dim]Not changed.[/dim]")
+            if console:
+                console.print("[dim]Not changed.[/dim]")
+            else:
+                print("Not changed.")
             return
     L.set_cfg(ASTRA_GEN_MODEL=name)
-    console.print("[green]Generation model set to %s[/green]" % name)
+    if console:
+        console.print("[green]Generation model set to %s[/green]" % name)
+    else:
+        print_success(f"Generation model set to {name}")
 
 
-def cmd_model(arg):
+def cmd_model(arg: Optional[str]) -> None:
     if not ensure_server():
         return
     installed = set(L.list_models())
@@ -313,7 +429,7 @@ def cmd_model(arg):
 # --------------------------------------------------------------------------
 # command: /model_upg  (upgrade installed models to the latest release)
 # --------------------------------------------------------------------------
-def cmd_model_upg():
+def cmd_model_upg() -> None:
     if not ensure_server():
         return
     installed = L.list_models()
@@ -321,7 +437,8 @@ def cmd_model_upg():
         console.print("[yellow]No models installed yet.[/yellow]")
         return
     console.print("[cyan]Upgrading installed models to their latest release…[/cyan]")
-    upgraded, failed = [], []
+    upgraded: List[str] = []
+    failed: List[str] = []
     for m in installed:
         console.print("\n[bold]› %s[/bold]" % m)
         # `ollama pull` re-fetches the tag; if it's already current it's a no-op.
@@ -339,12 +456,12 @@ def cmd_model_upg():
 # --------------------------------------------------------------------------
 # command: /r  (release)
 # --------------------------------------------------------------------------
-def _auto_tracking():
+def _auto_tracking() -> bool:
     raw = L.cfg("ASTRA_RELEASE")
     return not raw or raw.strip().lower() == "latest"
 
 
-def cmd_release(arg):
+def cmd_release(arg: Optional[str]) -> None:
     if not arg:
         cur = L.RELEASE()
         mode = " [dim](auto — tracks latest)[/dim]" if _auto_tracking() else ""
@@ -382,7 +499,7 @@ def cmd_release(arg):
 # --------------------------------------------------------------------------
 # command: /update  (pull docs + re-index)
 # --------------------------------------------------------------------------
-def cmd_update():
+def cmd_update() -> None:
     try:
         # No release passed in: let update() refresh the repo's default-branch
         # pointer first, so an auto-tracking ("latest") config picks up a
@@ -405,7 +522,7 @@ def cmd_update():
 # --------------------------------------------------------------------------
 # command: /reindex
 # --------------------------------------------------------------------------
-def cmd_reindex(arg):
+def cmd_reindex(arg: Optional[str]) -> None:
     if not ensure_server():
         return
     full = "--full" in (arg or "")
@@ -421,7 +538,7 @@ def cmd_reindex(arg):
 # --------------------------------------------------------------------------
 # command: /upgrade  (self-update the tool)
 # --------------------------------------------------------------------------
-def cmd_upgrade():
+def cmd_upgrade() -> None:
     here = L.HERE
     if not os.path.isdir(os.path.join(here, ".git")):
         console.print("[yellow]Astra is not a git checkout, so it can't self-update.\n"
@@ -441,7 +558,7 @@ def cmd_upgrade():
 # --------------------------------------------------------------------------
 # command: /clean  (wipe docs, models, and the index — back to a fresh checkout)
 # --------------------------------------------------------------------------
-def cmd_clean():
+def cmd_clean() -> None:
     here = L.HERE
     docs_root = L.DOCS_ROOT()
     db_files = sorted(glob.glob(os.path.join(here, "index-*.db*")))
@@ -555,19 +672,39 @@ def main():
         dispatch(" ".join(sys.argv[1:]))
         return
     banner()
+    history_file = os.path.join(L.HERE, ".astra_history") if _HISTORY_CAP else None
     while True:
         try:
-            line = console.input("\n[bold cyan]astra[/bold cyan] [dim](%s)[/dim] › "
-                                 % L.RELEASE())
+            if console:
+                line = console.input("\n[bold cyan]astra[/bold cyan] [dim](%s)[/dim] › "
+                                     % L.RELEASE())
+            else:
+                line = input(f"\nastra ({L.RELEASE()}) › ")
         except (EOFError, KeyboardInterrupt):
-            console.print()
+            if console:
+                console.print()
+            else:
+                print()
             break
+        # Save to history
+        if _HISTORY_CAP and line.strip():
+            try:
+                readline.add_history(line)
+                readline.write_history_file(history_file)
+            except Exception:
+                pass
         try:
             if not dispatch(line):
                 break
         except KeyboardInterrupt:
-            console.print("\n[dim](interrupted)[/dim]")
-    console.print("[dim]bye[/dim]")
+            if console:
+                console.print("\n[dim](interrupted)[/dim]")
+            else:
+                print("\n(interrupted)")
+    if console:
+        console.print("[dim]bye[/dim]")
+    else:
+        print("bye")
 
 
 if __name__ == "__main__":

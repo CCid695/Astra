@@ -8,17 +8,53 @@ Adapted from the rag-snowdocs / local_model pipeline, extended with:
   - .astrarc config load/save (release, models, docs path)
   - ServiceNow doc path -> official source URL derivation
 """
+from __future__ import annotations
 import os
 import re
 import json
 import sqlite3
 import urllib.request
+import logging
+from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Tool version. Bumped by +0.01 on every commit.
 VERSION = "0.28"
+
+# --------------------------------------------------------------------------
+# Logging setup
+# --------------------------------------------------------------------------
+def setup_logging() -> logging.Logger:
+    """Configure logging based on ASTRA_LOG_LEVEL config."""
+    log_level = cfg("ASTRA_LOG_LEVEL").upper()
+    logger = logging.getLogger("astra")
+
+    if not log_level:
+        logger.setLevel(logging.CRITICAL + 1)  # Disable logging
+        return logger
+
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+    }
+    logger.setLevel(level_map.get(log_level, logging.WARNING))
+
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
+
+# Initialize logger
+_logger = setup_logging()
 
 # --------------------------------------------------------------------------
 # Configuration (.astrarc — KEY=VALUE lines, also sourced by the shell launcher)
@@ -38,11 +74,18 @@ DEFAULTS = {
     "OLLAMA_HOST": "http://127.0.0.1:11434",
     # How long Ollama keeps the gen model resident after a call.
     "ASTRA_KEEP_ALIVE": "30m",
+    # Chunking and indexing parameters
+    "ASTRA_CHUNK_TARGET": "1000",                 # target chunk size in characters
+    "ASTRA_CHUNK_OVERLAP": "150",                 # chunk overlap in characters
+    "ASTRA_EMBED_BATCH": "64",                    # chunks per embedding request
+    "ASTRA_FILE_BATCH": "200",                    # files per DB transaction
+    # Logging: one of "DEBUG", "INFO", "WARNING", "ERROR", or "" (disabled)
+    "ASTRA_LOG_LEVEL": "",
 }
 
 
-def _read_rc():
-    vals = {}
+def _read_rc() -> Dict[str, str]:
+    vals: Dict[str, str] = {}
     if os.path.exists(RC_PATH):
         with open(RC_PATH, "r", encoding="utf-8") as f:
             for line in f:
@@ -54,17 +97,17 @@ def _read_rc():
     return vals
 
 
-def cfg(key):
+def cfg(key: str) -> str:
     """Resolve a config value: environment > .astrarc > built-in default."""
     if key in os.environ:
         return os.environ[key]
     rc = _read_rc()
     if key in rc:
         return rc[key]
-    return DEFAULTS.get(key)
+    return DEFAULTS.get(key, "")
 
 
-def set_cfg(**kwargs):
+def set_cfg(**kwargs: str) -> Dict[str, str]:
     """Persist one or more config values to .astrarc (merging with existing)."""
     vals = _read_rc()
     vals.update({k: str(v) for k, v in kwargs.items()})
@@ -81,10 +124,10 @@ def set_cfg(**kwargs):
 
 
 # Convenience accessors ----------------------------------------------------
-def OLLAMA():       return cfg("OLLAMA_HOST")
-def EMBED_MODEL():  return cfg("ASTRA_EMBED_MODEL")
-def GEN_MODEL():    return cfg("ASTRA_GEN_MODEL")
-def RELEASE():
+def OLLAMA() -> str:       return cfg("OLLAMA_HOST")
+def EMBED_MODEL() -> str:  return cfg("ASTRA_EMBED_MODEL")
+def GEN_MODEL() -> str:    return cfg("ASTRA_GEN_MODEL")
+def RELEASE() -> str:
     """Current release family. Resolves the "latest" sentinel (the default)
     against the docs repo's advertised default branch, so a newly published
     ServiceNow release is picked up automatically without user action."""
@@ -93,11 +136,15 @@ def RELEASE():
         import astra_corpus as C   # deferred: astra_corpus imports this module
         return C.latest_release() or "australia"
     return val
-def DOCS_ROOT():    return os.path.expanduser(cfg("ASTRA_DOCS"))
-def KEEP_ALIVE():   return cfg("ASTRA_KEEP_ALIVE")
+def DOCS_ROOT() -> str:    return os.path.expanduser(cfg("ASTRA_DOCS"))
+def KEEP_ALIVE() -> str:   return cfg("ASTRA_KEEP_ALIVE")
+def CHUNK_TARGET() -> int: return int(cfg("ASTRA_CHUNK_TARGET"))
+def CHUNK_OVERLAP() -> int: return int(cfg("ASTRA_CHUNK_OVERLAP"))
+def EMBED_BATCH() -> int:  return int(cfg("ASTRA_EMBED_BATCH"))
+def FILE_BATCH() -> int:   return int(cfg("ASTRA_FILE_BATCH"))
 
 
-def db_path(release=None):
+def db_path(release: Optional[str] = None) -> str:
     """Per-release vector store. Overridable with ASTRA_DB for testing."""
     if os.environ.get("ASTRA_DB"):
         return os.environ["ASTRA_DB"]
@@ -115,16 +162,19 @@ QUERY_PREFIX = "search_query: "
 # --------------------------------------------------------------------------
 # Ollama HTTP
 # --------------------------------------------------------------------------
-def _post(path, payload, timeout=900):
+def _post(path: str, payload: Dict[str, Any], timeout: int = 900) -> Dict[str, Any]:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         OLLAMA() + path, data=data, headers={"Content-Type": "application/json"}
     )
+    _logger.debug("Ollama request: %s", path)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+        response = json.loads(r.read().decode())
+        _logger.debug("Ollama response status: %d", r.status)
+        return response
 
 
-def server_up():
+def server_up() -> bool:
     try:
         with urllib.request.urlopen(OLLAMA() + "/api/version", timeout=3) as r:
             return r.status == 200
@@ -132,7 +182,7 @@ def server_up():
         return False
 
 
-def list_models():
+def list_models() -> List[str]:
     """Names of models currently pulled into the local Ollama."""
     try:
         with urllib.request.urlopen(OLLAMA() + "/api/tags", timeout=5) as r:
@@ -142,18 +192,21 @@ def list_models():
         return []
 
 
-def embed(texts, is_query=False):
+def embed(texts: List[str], is_query: bool = False) -> np.ndarray:
     """Return an (N, D) float32 array of L2-normalized embeddings."""
+    _logger.debug("Embedding %d texts (is_query=%s)", len(texts), is_query)
     prefix = QUERY_PREFIX if is_query else DOC_PREFIX
     inp = [prefix + t for t in texts]
     out = _post("/api/embed", {"model": EMBED_MODEL(), "input": inp})
     arr = np.array(out["embeddings"], dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
+    _logger.debug("Embeddings computed: shape=%s", arr.shape)
     return arr / norms
 
 
-def generate(prompt, system=None, options=None, model=None):
+def generate(prompt: str, system: Optional[str] = None, options: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> str:
+    _logger.debug("Generating with model: %s", model or GEN_MODEL())
     payload = {
         "model": model or GEN_MODEL(),
         "prompt": prompt,
@@ -164,25 +217,28 @@ def generate(prompt, system=None, options=None, model=None):
         payload["system"] = system
     payload["options"] = options or {"temperature": 0.2, "num_ctx": 8192}
     out = _post("/api/generate", payload)
-    return out.get("response", "")
+    response = out.get("response", "")
+    _logger.debug("Generated response length: %d", len(response))
+    return response
 
 
-def preload(model=None):
+def preload(model: Optional[str] = None) -> None:
     """Warm the gen model without generating, so the first query is fast."""
+    _logger.debug("Preloading model: %s", model or GEN_MODEL())
     try:
         _post(
             "/api/generate",
             {"model": model or GEN_MODEL(), "keep_alive": KEEP_ALIVE()},
             timeout=300,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("Preload failed: %s", e)
 
 
 # --------------------------------------------------------------------------
 # SQLite vector store
 # --------------------------------------------------------------------------
-def connect(release=None):
+def connect(release: Optional[str] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path(release), timeout=60)
     # Wait out transient locks (e.g. another writer, or a backup/AV tool
     # briefly holding the file) instead of failing immediately.
@@ -200,10 +256,15 @@ def connect(release=None):
     return conn
 
 
-def chunk_text(text, target=1000, overlap=150):
+def chunk_text(text: str, target: Optional[int] = None, overlap: Optional[int] = None) -> List[str]:
     """Split on blank lines, then pack paragraphs into ~target-char chunks."""
+    if target is None:
+        target = CHUNK_TARGET()
+    if overlap is None:
+        overlap = CHUNK_OVERLAP()
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks, cur = [], ""
+    chunks: List[str] = []
+    cur = ""
     for p in paras:
         if len(cur) + len(p) + 2 <= target:
             cur = (cur + "\n\n" + p) if cur else p
@@ -227,7 +288,7 @@ def chunk_text(text, target=1000, overlap=150):
 GITHUB_REPO = "ServiceNow/ServiceNowDocs"
 
 
-def rel_markdown_path(abs_path, release=None):
+def rel_markdown_path(abs_path: str, release: Optional[str] = None) -> str:
     """Path relative to the release's markdown/ root, e.g.
     'healthcare-life-sciences/ctwm-reference.md'. Falls back to basename."""
     p = os.path.abspath(abs_path)
@@ -238,7 +299,7 @@ def rel_markdown_path(abs_path, release=None):
     return os.path.basename(p)
 
 
-def source_urls(abs_path, release=None):
+def source_urls(abs_path: str, release: Optional[str] = None) -> Dict[str, str]:
     """Return the official ServiceNow docs link for a doc file.
 
     Uses the context-sensitive-help (CSH) URL, which deep-links to the rendered
@@ -264,7 +325,7 @@ def source_urls(abs_path, release=None):
 _FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-def read_frontmatter(abs_path):
+def read_frontmatter(abs_path: str) -> Dict[str, str]:
     """Return the YAML-ish frontmatter as a flat dict (best-effort, no deps)."""
     try:
         with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
@@ -274,7 +335,7 @@ def read_frontmatter(abs_path):
     m = _FM_RE.match(head)
     if not m:
         return {}
-    meta = {}
+    meta: Dict[str, str] = {}
     for line in m.group(1).splitlines():
         if ":" in line and not line.startswith(" "):
             k, v = line.split(":", 1)
@@ -282,7 +343,7 @@ def read_frontmatter(abs_path):
     return meta
 
 
-def doc_title(abs_path):
+def doc_title(abs_path: str) -> str:
     meta = read_frontmatter(abs_path)
     if meta.get("title"):
         return meta["title"]
