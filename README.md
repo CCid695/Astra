@@ -1,10 +1,10 @@
 # Astra
 
-Ask questions about the **ServiceNow product documentation** in natural language —
+Ask questions and find from the **ServiceNow product documentation** in natural language —
 answered by models running **entirely on your own machine**. Nothing leaves the
 host and no cloud tokens are spent.
 
-Astra is an interactive CLI (beacon-style slash commands). Ask in any language:
+Astra is an interactive CLI. Ask in any language:
 it understands the question with a local LLM, searches your local copy of the
 docs, summarizes an answer **in the language you asked in**, and cites the exact
 official documentation pages it used.
